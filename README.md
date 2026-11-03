@@ -1,7 +1,17 @@
 # OpenCoder-Agent
 
 OpenCoder-Agent is a modular Python AI agent with two entry points: a Discord bot and an interactive terminal CLI. It keeps the original agent, provider fallback, tool catalog, file operations, web search, code verification loop, and optional E2B execution while keeping the project structure small.
+<div align="center">
+  <img src="imagenes/opencoder.gif" width="100%" alt="OpenCoder-Agent Banner">
+  
+  <br>
+  <br>
 
+  <a href="https://github.com/keerdever-gif/OpenCoder-Agent/releases"><img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-yellow.svg" alt="Python"></a>
+  <a href="https://github.com/keerdever-gif/OpenCoder-Agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/status-active-brightgreen.svg" alt="Status">
+</div>
 ## Features
 
 - Discord bot and interactive CLI
