@@ -100,6 +100,12 @@ def _load_slots(default_model: str) -> list[AISlot]:
     return sorted(slots, key=lambda slot: slot.index)
 
 
+def _port() -> int:
+    """WEB_PORT overrides PORT; otherwise preserve the existing PORT setting."""
+    variable = "WEB_PORT" if _env("WEB_PORT") is not None else "PORT"
+    return _int(variable, 8080, 1, 65535)
+
+
 def load_settings() -> Settings:
     discord_user = _env("DISCORD_ALLOWED_USER_ID")
     try:
@@ -123,7 +129,7 @@ def load_settings() -> Settings:
         memory_limit=_int("MEMORY_LIMIT", 120, 0, 10080),
         memory_messages=_int("MEMORY_MESSAGES", 12, 2, 200),
         workspace=_env("OPENCODER_WORKSPACE", _env("SUBTOM_WORKSPACE", "./workspace")) or "./workspace",
-        port=_int("PORT", 8080, 1, 65535),
+        port=_port(),
         github_token=_env("GITHUB_TOKEN"),
         vercel_token=_env("VERCEL_TOKEN"),
         flux_api_key_1=_env("FLUX_API_KEY_1"),

@@ -12,7 +12,7 @@ import aiohttp
 from aiohttp import web
 import discord
 
-from loop_agent.agent import agent
+from loop_agent.manager import manager
 from config import config
 from loop_agent.connector import connector
 from loop_agent.motor import motor
@@ -898,7 +898,7 @@ async def _process_message(
         pass
 
     try:
-        result = await agent.ask(
+        result = await manager.ask(
             message.author.id,
             message.channel.id,
             full_prompt,
@@ -1028,7 +1028,7 @@ async def main() -> None:
         if not config.ai_slots:
             raise RuntimeError("Configure at least one AI_API_KEY before starting the bot.")
 
-        await agent.init()
+        await manager.init()
 
         _HTTP_RUNNER = await start_http()
 
@@ -1063,7 +1063,7 @@ async def main() -> None:
             )
 
         try:
-            await agent.close()
+            await manager.close()
         except Exception as exc:
             print(
                 f"[CLOSE AGENT] "

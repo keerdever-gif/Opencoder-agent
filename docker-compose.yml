@@ -6,6 +6,8 @@ services:
       - .env
     environment:
       OPENCODER_WORKSPACE: /app/workspace
+    ports:
+      - "${WEB_PORT:-${PORT:-8080}}:${WEB_PORT:-${PORT:-8080}}"
     volumes:
       - ./workspace:/app/workspace
     restart: unless-stopped
