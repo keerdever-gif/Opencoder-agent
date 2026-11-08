@@ -55,7 +55,84 @@ def run() -> None:
         matches = tools.discover_tools("extract ZIP archive", limit=5)
         assert matches["total_capabilities"] == 300
         assert matches["results"]
-        print("OK: ZIP extraction, Zip Slip protection, no-overwrite behavior, and 300-capability catalog")
+
+        # Workspace root and non-empty recursive deletes require explicit confirmation.
+        try:
+            tools.delete(".")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Workspace root deletion was allowed")
+        protected = root / "protected"
+        protected.mkdir()
+        (protected / "keep.txt").write_text("keep", encoding="utf-8")
+        try:
+            tools.delete("protected", recursive=True)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Recursive delete did not require confirmation")
+        tools.delete("protected", recursive=True, confirm=True)
+        assert not protected.exists()
+
+        # Writes are size-limited and atomic; rejected writes preserve existing content.
+        limited = FileTools(root / "limited", max_file_bytes=8, max_read_bytes=8)
+        limited.write_file("stable.txt", "safe")
+        try:
+            limited.write_file("stable.txt", "this is too long")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("Oversized write was accepted")
+        assert (root / "limited" / "stable.txt").read_text(encoding="utf-8") == "safe"
+        try:
+            limited.append_file("stable.txt", "too long")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("Oversized append was accepted")
+        assert (root / "limited" / "stable.txt").read_text(encoding="utf-8") == "safe"
+
+        # Secret files are not readable or included in ordinary listings.
+        (root / ".env").write_text("API_KEY=do-not-expose", encoding="utf-8")
+        (root / ".git").mkdir()
+        (root / ".git" / "config").write_text("internal", encoding="utf-8")
+        (root / ".venv").mkdir()
+        (root / ".venv" / "pyvenv.cfg").write_text("internal", encoding="utf-8")
+        try:
+            tools.read_file(".env")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Secret file was readable")
+        listed = {entry["name"] for entry in tools.list_files(".")}
+        assert ".env" not in listed and ".git" not in listed and ".venv" not in listed
+
+        # ZIP extraction validates all entries before committing any files.
+        with zipfile.ZipFile(root / "late-slip.zip", "w") as archive:
+            archive.writestr("safe/first.txt", "must not appear")
+            archive.writestr("../../escape.txt", "blocked")
+        try:
+            tools.zip_extract("late-slip.zip", "transactional")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Unsafe ZIP entry was accepted")
+        assert not (root / "transactional" / "safe" / "first.txt").exists()
+
+        # Duplicate ZIP paths are rejected before extraction.
+        with zipfile.ZipFile(root / "duplicate.zip", "w") as archive:
+            archive.writestr("same.txt", "first")
+            archive.writestr("same.txt", "second")
+        try:
+            tools.zip_extract("duplicate.zip", "duplicate-output")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("Duplicate ZIP entries were accepted")
+        assert not (root / "duplicate-output" / "same.txt").exists()
+
+        print("OK: workspace guards, atomic bounded writes, secret filtering, transactional ZIP extraction, and 300-capability catalog")
 
 
 if __name__ == "__main__":
