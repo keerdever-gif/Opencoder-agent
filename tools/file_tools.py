@@ -18,6 +18,9 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
+import tempfile
+import unicodedata
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -84,6 +87,13 @@ PDF_EXTENSIONS = {".pdf"}
 
 MAX_TEXT_RESULT = 30000
 MAX_LINES_RESULT = 2000
+DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024
+EXCLUDED_NAMES = {
+    ".git", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "node_modules",
+}
+RESERVED_DIRS = {".git", ".opencode"}
 
 
 class FileToolsError(Exception):
@@ -98,9 +108,19 @@ class FileTools:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
     ]
 
-    def __init__(self, workspace: str | Path = "."):
+    def __init__(
+        self,
+        workspace: str | Path = ".",
+        *,
+        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
+    ):
+        if max_file_bytes <= 0 or max_read_bytes <= 0:
+            raise ValueError("File size limits must be positive.")
         self.workspace = Path(workspace).expanduser().resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.max_file_bytes = max_file_bytes
+        self.max_read_bytes = max_read_bytes
         self._ua_index = 0
 
     def _next_ua(self) -> str:
@@ -122,6 +142,71 @@ class FileTools:
         return p
 
     @staticmethod
+    def _is_sensitive_path(path: Path) -> bool:
+        parts = [part.casefold() for part in path.parts]
+        name = path.name.casefold()
+        if name == ".env.example":
+            return False
+        if name == ".env" or name.startswith(".env."):
+            return True
+        if name in {
+            "credentials.json", "service-account.json", "id_rsa", "id_ed25519",
+            "id_ecdsa", "id_ed25519_sk", "secrets.json",
+        }:
+            return True
+        if name.endswith((".pem", ".key", ".p12", ".pfx", ".keystore")):
+            return True
+        return any(part in {".ssh", ".aws", ".azure", ".gnupg", "secrets", "credentials"} for part in parts)
+
+    def _assert_readable(self, name: str | Path) -> Path:
+        path = self._path(name)
+        if self._is_sensitive_path(path):
+            raise PermissionError("Reading credential and secret files is disabled.")
+        if path.is_file() and path.stat().st_size > self.max_read_bytes:
+            raise FileToolsError(
+                f"File exceeds the read limit ({self.max_read_bytes} bytes)."
+            )
+        return path
+
+    @staticmethod
+    def _is_excluded_path(relative: Path) -> bool:
+        return (
+            any(part.casefold() in EXCLUDED_NAMES for part in relative.parts)
+            or FileTools._is_sensitive_path(relative)
+        )
+
+    @staticmethod
+    def _atomic_write(path: Path, data: bytes, *, overwrite: bool = True) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if overwrite:
+                os.replace(temporary, path)
+            else:
+                os.link(temporary, path)
+                os.unlink(temporary)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _encode_text(self, content: str, encoding: str) -> bytes:
+        data = content.encode(encoding)
+        if len(data) > self.max_file_bytes:
+            raise FileToolsError(
+                f"File exceeds the write limit ({self.max_file_bytes} bytes)."
+            )
+        return data
+
+    @staticmethod
     def _truncate(text: str, limit: int = MAX_TEXT_RESULT) -> str:
         if len(text) <= limit:
             return text
@@ -136,37 +221,53 @@ class FileTools:
         encoding: str = "utf-8", overwrite: bool = False,
     ) -> str:
         path = self._path(name)
-        if path.exists() and not overwrite:
-            raise FileExistsError(f"Ya existe: {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding=encoding)
+        data = self._encode_text(content, encoding)
+        self._atomic_write(path, data, overwrite=overwrite)
         return str(path)
 
     def write_file(self, name: str, content: str, encoding: str = "utf-8") -> str:
         path = self._path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding=encoding)
+        self._atomic_write(path, self._encode_text(content, encoding))
         return str(path)
 
     def append_file(self, name: str, content: str, encoding: str = "utf-8") -> str:
         path = self._path(name)
+        data = self._encode_text(content, encoding)
+        current_size = path.stat().st_size if path.exists() else 0
+        if current_size + len(data) > self.max_file_bytes:
+            raise FileToolsError(
+                f"File exceeds the write limit ({self.max_file_bytes} bytes)."
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding=encoding) as f:
-            f.write(content)
+        with path.open("ab") as stream:
+            stream.write(data)
+            stream.flush()
         return str(path)
 
     def read_file(self, name: str, encoding: str = "utf-8") -> str:
-        content = self._path(name).read_text(encoding=encoding)
-        return self._truncate(content)
+        path = self._assert_readable(name)
+        return self._truncate(path.read_bytes().decode(encoding))
 
     def create_binary_file(self, name: str, data_base64: str) -> str:
         path = self._path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(base64.b64decode(data_base64))
+        try:
+            data = base64.b64decode(data_base64, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise FileToolsError("Invalid Base64 input.") from exc
+        if len(data) > self.max_file_bytes:
+            raise FileToolsError(
+                f"File exceeds the write limit ({self.max_file_bytes} bytes)."
+            )
+        self._atomic_write(path, data)
         return str(path)
 
     def read_binary_file_base64(self, name: str) -> str:
-        return base64.b64encode(self._path(name).read_bytes()).decode("ascii")
+        path = self._assert_readable(name)
+        if path.stat().st_size > self.max_read_bytes:
+            raise FileToolsError(
+                f"File exceeds the binary read limit ({self.max_read_bytes} bytes)."
+            )
+        return base64.b64encode(path.read_bytes()).decode("ascii")
 
     def mkdir(self, name: str) -> str:
         path = self._path(name)
@@ -184,10 +285,13 @@ class FileTools:
         if not path.is_dir():
             raise NotADirectoryError(str(path))
         result = []
-        for item in sorted(path.iterdir(), key=lambda x: x.name.lower()):
+        for item in sorted(path.iterdir(), key=lambda x: x.name.casefold()):
+            relative = item.relative_to(self.workspace)
+            if item.is_symlink() or self._is_excluded_path(relative):
+                continue
             result.append({
                 "name": item.name,
-                "path": str(item.relative_to(self.workspace)),
+                "path": str(relative),
                 "type": "directory" if item.is_dir() else "file",
                 "size": item.stat().st_size if item.is_file() else None,
             })
@@ -195,86 +299,158 @@ class FileTools:
 
     def info(self, name: str) -> dict[str, Any]:
         path = self._path(name)
-        stat = path.stat()
+        file_stat = path.stat()
         return {
             "name": path.name,
             "path": str(path.relative_to(self.workspace)),
             "absolute_path": str(path),
             "type": "directory" if path.is_dir() else "file",
-            "size": stat.st_size,
+            "size": file_stat.st_size,
         }
+
+    @staticmethod
+    def _copy_file_safe(source: str, destination: str) -> str:
+        shutil.copyfile(source, destination)
+        os.chmod(destination, 0o600)
+        return destination
 
     def copy(self, source: str, destination: str) -> str:
         src = self._path(source)
         dst = self._path(destination)
+        if dst.exists():
+            raise FileExistsError(str(dst))
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            shutil.copytree(
+                src, dst, copy_function=self._copy_file_safe, symlinks=True
+            )
         else:
-            shutil.copy2(src, dst)
+            self._copy_file_safe(str(src), str(dst))
         return str(dst)
 
     def move(self, source: str, destination: str) -> str:
         src = self._path(source)
         dst = self._path(destination)
+        if dst.exists():
+            raise FileExistsError(str(dst))
+        if src == self.workspace:
+            raise PermissionError("The workspace root cannot be moved.")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        return str(shutil.move(str(src), str(dst)))
+        os.replace(src, dst)
+        return str(dst)
 
-    def delete(self, name: str, recursive: bool = False) -> bool:
+    def delete(
+        self, name: str, recursive: bool = False, confirm: bool = False
+    ) -> bool:
         path = self._path(name)
+        if path == self.workspace:
+            raise PermissionError("The workspace root cannot be deleted.")
+        relative = path.relative_to(self.workspace)
+        if any(part.casefold() in RESERVED_DIRS for part in relative.parts):
+            raise PermissionError("Reserved project directories cannot be deleted.")
         if path.is_dir():
-            if not recursive:
-                path.rmdir()
-            else:
+            has_contents = any(path.iterdir())
+            if has_contents and recursive and not confirm:
+                raise PermissionError(
+                    "Deleting a non-empty directory requires confirm=true."
+                )
+            if recursive:
                 shutil.rmtree(path)
+            else:
+                path.rmdir()
         else:
             path.unlink()
         return True
     # ZIP
     def zip_create(
-        self, output_zip: str, sources: list[str],
+        self,
+        output_zip: str,
+        sources: list[str],
         compression: int = zipfile.ZIP_DEFLATED,
+        *,
+        overwrite: bool = False,
     ) -> str:
         zip_path = self._path(output_zip)
-        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        if zip_path.exists() and not overwrite:
+            raise FileExistsError(str(zip_path))
+        if compression not in {
+            zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED,
+            zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA,
+        }:
+            raise ValueError("Unsupported ZIP compression method.")
+
         resolved_sources: list[Path] = []
         for source in sources:
             src = self._path(source)
             if not src.exists():
                 raise FileNotFoundError(str(src))
-            if src.is_file() and src.resolve() == zip_path:
-                raise ValueError("The output ZIP cannot also be one of the source files.")
+            if src == zip_path:
+                raise ValueError("The output ZIP cannot also be a source.")
             resolved_sources.append(src)
 
-        seen: set[str] = set()
-        with zipfile.ZipFile(zip_path, "w", compression=compression) as zf:
-            for src in resolved_sources:
-                candidates = src.rglob("*") if src.is_dir() else (src,)
-                for item in candidates:
-                    try:
-                        if not item.is_file():
-                            continue
-                        resolved = item.resolve(strict=True)
-                        # Do not follow symlinks that escape the workspace.
-                        relative = resolved.relative_to(self.workspace)
-                    except (OSError, ValueError, RuntimeError):
-                        continue
-                    if resolved == zip_path or str(relative) in seen:
-                        continue
-                    seen.add(str(relative))
-                    zf.write(resolved, relative)
+        members: dict[str, Path] = {}
+        for src in resolved_sources:
+            if src.is_file():
+                candidates = [src]
+            else:
+                candidates = []
+                for root, directories, files in os.walk(src, followlinks=False):
+                    root_path = Path(root)
+                    directories[:] = sorted(
+                        name for name in directories
+                        if not (root_path / name).is_symlink()
+                        and not self._is_excluded_path(
+                            (root_path / name).relative_to(self.workspace)
+                        )
+                    )
+                    for name in sorted(files):
+                        candidates.append(root_path / name)
+
+            for item in candidates:
+                if item.is_symlink() or not item.is_file():
+                    continue
+                relative = item.relative_to(self.workspace)
+                if self._is_excluded_path(relative):
+                    continue
+                members[str(relative)] = item
+
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{zip_path.name}.", suffix=".tmp", dir=str(zip_path.parent)
+        )
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=compression) as archive:
+                for relative, item in sorted(members.items(), key=lambda pair: pair[0].casefold()):
+                    archive.write(item, relative)
+            if overwrite:
+                os.replace(temporary, zip_path)
+            else:
+                os.link(temporary, zip_path)
+                os.unlink(temporary)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
         return str(zip_path)
 
-    def zip_list(self, zip_name: str) -> list[dict[str, Any]]:
+    def zip_list(
+        self, zip_name: str, *, limit: int = 200, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 500 or offset < 0:
+            raise ValueError("limit must be 1..500 and offset must be non-negative.")
         zip_path = self._path(zip_name)
-        with zipfile.ZipFile(zip_path, "r") as zf:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            members = archive.infolist()[offset:offset + limit]
             return [
                 {
                     "name": info.filename,
                     "size": info.file_size,
                     "compressed_size": info.compress_size,
                 }
-                for info in zf.infolist()
+                for info in members
             ]
 
     def zip_extract(
@@ -287,94 +463,217 @@ class FileTools:
         max_total_bytes: int = 500 * 1024 * 1024,
         max_file_bytes: int = 100 * 1024 * 1024,
         max_compression_ratio: int = 200,
+        max_path_chars: int = 240,
     ) -> list[str]:
-        """Extract a ZIP safely, rejecting traversal, symlinks, and oversized archives."""
+        """Validate and stage every ZIP member before committing any extracted file."""
         zip_path = self._path(zip_name)
         if not zip_path.is_file():
             raise FileNotFoundError(f"ZIP archive not found: {zip_name}")
         if not zipfile.is_zipfile(zip_path):
             raise FileToolsError(f"The file is not a valid ZIP archive: {zip_name}")
+        if min(max_entries, max_total_bytes, max_file_bytes, max_compression_ratio, max_path_chars) <= 0:
+            raise ValueError("ZIP extraction limits must be positive.")
 
         dest = self._path(destination)
-        dest.mkdir(parents=True, exist_ok=True)
-        dest_root = dest.resolve()
+        if dest.exists() and not dest.is_dir():
+            raise NotADirectoryError(str(dest))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        stage_root = Path(tempfile.mkdtemp(prefix=".opencoder-unzip-", dir=str(dest.parent)))
+        payload = stage_root / "payload"
+        backups_root = stage_root / "backups"
+        payload.mkdir()
         extracted: list[str] = []
-        total_uncompressed = 0
+        installed: list[Path] = []
+        backups: list[tuple[Path, Path]] = []
+        created_dirs: list[Path] = []
 
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            members = zf.infolist()
-            if len(members) > max_entries:
-                raise FileToolsError(
-                    f"ZIP rejected: contains {len(members)} entries; maximum {max_entries}."
-                )
+        try:
+            file_members: list[tuple[zipfile.ZipInfo, tuple[str, ...]]] = []
+            directory_names: dict[str, tuple[str, ...]] = {}
+            file_names: set[str] = set()
+            explicit_directories: set[str] = set()
+            spelling_by_key: dict[str, str] = {}
+            total_expected = 0
 
-            for member in members:
-                raw_name = member.filename
-                # ZIP archives use POSIX separators, even when created on Windows.
-                safe_name = raw_name.replace("\\", "/")
-                pure = Path(safe_name)
-                if (
-                    not safe_name
-                    or safe_name.startswith("/")
-                    or pure.is_absolute()
-                    or any(part in {"..", ""} for part in safe_name.split("/") if part != "")
-                    or re.match(r"^[A-Za-z]:", safe_name)
-                ):
-                    raise PermissionError(f"ZIP rejected due to unsafe path: {raw_name}")
-
-                # Reject symlinks that could redirect writes outside the destination.
-                unix_mode = (member.external_attr >> 16) & 0xFFFF
-                if (unix_mode & 0o170000) == 0o120000:
-                    raise PermissionError(f"ZIP rejected: symbolic link: {raw_name}")
-
-                target = (dest_root / safe_name).resolve()
-                try:
-                    target.relative_to(dest_root)
-                except ValueError as exc:
-                    raise PermissionError(f"ZIP rejected due to unsafe path: {raw_name}") from exc
-
-                if member.is_dir() or safe_name.endswith("/"):
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-
-                if member.flag_bits & 0x1:
-                    raise FileToolsError(f"Encrypted ZIP archives are not supported: {raw_name}")
-                if member.file_size > max_file_bytes:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                members = archive.infolist()
+                if len(members) > max_entries:
                     raise FileToolsError(
-                        f"ZIP member is too large ({member.file_size} bytes): {raw_name}"
+                        f"ZIP rejected: contains {len(members)} entries; maximum {max_entries}."
                     )
-                total_uncompressed += member.file_size
-                if total_uncompressed > max_total_bytes:
-                    raise FileToolsError(
-                        f"ZIP exceeds the maximum total extraction size ({max_total_bytes} bytes)."
-                    )
-                if member.file_size and member.compress_size == 0:
-                    raise FileToolsError(f"Abnormal compression ratio: {raw_name}")
-                if member.compress_size and member.file_size / member.compress_size > max_compression_ratio:
-                    raise FileToolsError(f"Possible ZIP bomb: excessive compression ratio in {raw_name}")
 
+                for member in members:
+                    raw_name = member.filename
+                    safe_name = raw_name.replace("\\", "/")
+                    is_directory = member.is_dir() or safe_name.endswith("/")
+                    clean_name = safe_name[:-1] if is_directory else safe_name
+                    if (
+                        not clean_name
+                        or clean_name.startswith("/")
+                        or re.match(r"^[A-Za-z]:", clean_name)
+                        or len(clean_name) > max_path_chars
+                        or any(ord(char) < 32 or ord(char) == 127 for char in clean_name)
+                    ):
+                        raise PermissionError(f"ZIP rejected due to unsafe path: {raw_name}")
+
+                    parts = tuple(unicodedata.normalize("NFC", part) for part in clean_name.split("/"))
+                    if any(not part or part in {".", ".."} for part in parts):
+                        raise PermissionError(f"ZIP rejected due to unsafe path: {raw_name}")
+                    for part in parts:
+                        windows_name = part.rstrip(" .").split(".", 1)[0].upper()
+                        if (
+                            part.endswith((" ", "."))
+                            or windows_name in {"CON", "PRN", "AUX", "NUL"}
+                            or re.fullmatch(r"(COM|LPT)[1-9]", windows_name)
+                        ):
+                            raise PermissionError(f"ZIP rejected due to non-portable path: {raw_name}")
+
+                    unix_mode = (member.external_attr >> 16) & 0xFFFF
+                    file_type = stat.S_IFMT(unix_mode)
+                    allowed_types = {0, stat.S_IFREG, stat.S_IFDIR}
+                    if file_type not in allowed_types:
+                        raise PermissionError(f"ZIP rejected: special file type: {raw_name}")
+
+                    canonical_parts = tuple(part.casefold() for part in parts)
+                    key = "/".join(canonical_parts)
+                    for index in range(1, len(parts) + 1):
+                        prefix_key = "/".join(canonical_parts[:index])
+                        prefix_name = "/".join(parts[:index])
+                        previous = spelling_by_key.get(prefix_key)
+                        if previous is not None and previous != prefix_name:
+                            raise FileToolsError(f"ZIP contains case-insensitive path collisions: {raw_name}")
+                        spelling_by_key[prefix_key] = prefix_name
+
+                    if is_directory:
+                        if key in file_names or key in explicit_directories:
+                            raise FileToolsError(f"ZIP contains duplicate or conflicting paths: {raw_name}")
+                        explicit_directories.add(key)
+                        directory_names[key] = parts
+                        continue
+
+                    if member.flag_bits & 0x1:
+                        raise FileToolsError(f"Encrypted ZIP archives are not supported: {raw_name}")
+                    if key in file_names or key in directory_names:
+                        raise FileToolsError(f"ZIP contains duplicate or conflicting paths: {raw_name}")
+                    if member.file_size > max_file_bytes:
+                        raise FileToolsError(f"ZIP member is too large: {raw_name}")
+                    total_expected += member.file_size
+                    if total_expected > max_total_bytes:
+                        raise FileToolsError("ZIP exceeds the maximum total extraction size.")
+                    if member.file_size and member.compress_size == 0:
+                        raise FileToolsError(f"Abnormal compression ratio: {raw_name}")
+                    if member.compress_size and member.file_size / member.compress_size > max_compression_ratio:
+                        raise FileToolsError(f"Possible ZIP bomb: {raw_name}")
+
+                    for index in range(1, len(parts)):
+                        parent_key = "/".join(canonical_parts[:index])
+                        if parent_key in file_names:
+                            raise FileToolsError(f"ZIP file/directory prefix collision: {raw_name}")
+                        directory_names.setdefault(parent_key, parts[:index])
+                    if key in directory_names:
+                        raise FileToolsError(f"ZIP file/directory collision: {raw_name}")
+                    file_names.add(key)
+                    file_members.append((member, parts))
+
+                for file_key in file_names:
+                    prefix = file_key + "/"
+                    if any(directory_key.startswith(prefix) for directory_key in directory_names):
+                        raise FileToolsError("ZIP contains a file/directory prefix collision.")
+
+                for member, parts in file_members:
+                    staged_file = payload.joinpath(*parts)
+                    staged_file.parent.mkdir(parents=True, exist_ok=True)
+                    written = 0
+                    with archive.open(member, "r") as stream, staged_file.open("xb") as output:
+                        while True:
+                            chunk = stream.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > max_file_bytes or written > member.file_size:
+                                raise FileToolsError(f"Unexpected actual size while extracting: {member.filename}")
+                            output.write(chunk)
+                    if written != member.file_size:
+                        raise FileToolsError(f"Incomplete extraction: {member.filename}")
+                    os.chmod(staged_file, 0o600)
+
+            if dest.exists() and not dest.is_dir():
+                raise NotADirectoryError(str(dest))
+            all_directories = sorted(
+                directory_names.values(),
+                key=lambda parts: (len(parts), "/".join(parts).casefold()),
+            )
+            for parts in all_directories:
+                target = dest.joinpath(*parts)
+                cursor = dest
+                for part in parts:
+                    cursor = cursor / part
+                    if cursor.is_symlink():
+                        raise PermissionError(f"Extraction target contains a symbolic link: {cursor}")
+                if target.exists() and not target.is_dir():
+                    raise FileExistsError(f"Extraction directory conflicts with a file: {target}")
+
+            for _, parts in file_members:
+                target = dest.joinpath(*parts)
+                cursor = dest
+                for part in parts:
+                    cursor = cursor / part
+                    if cursor.is_symlink():
+                        raise PermissionError(f"Extraction target contains a symbolic link: {cursor}")
+                if target.exists():
+                    if target.is_dir():
+                        raise FileExistsError(f"Extraction file conflicts with a directory: {target}")
+                    if not overwrite:
+                        raise FileExistsError(f"Destination already exists: {target}")
+
+            def make_directory(path: Path) -> None:
+                if path.exists():
+                    if not path.is_dir():
+                        raise FileExistsError(f"Directory path is occupied: {path}")
+                    return
+                if path.parent != path:
+                    make_directory(path.parent)
+                path.mkdir()
+                created_dirs.append(path)
+
+            make_directory(dest)
+            for parts in all_directories:
+                make_directory(dest.joinpath(*parts))
+
+            for _, parts in file_members:
+                staged_file = payload.joinpath(*parts)
+                target = dest.joinpath(*parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists() and not overwrite:
-                    raise FileExistsError(
-                        f"Destination already exists: {target.relative_to(dest_root)}. "
-                        "Usa overwrite=true para reemplazarlo."
-                    )
-                mode = "wb" if overwrite else "xb"
-                written = 0
-                with zf.open(member, "r") as source, target.open(mode) as output:
-                    while True:
-                        chunk = source.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > max_file_bytes or written > member.file_size:
-                            raise FileToolsError(f"Unexpected actual size while extracting: {raw_name}")
-                        output.write(chunk)
-                if written != member.file_size:
-                    raise FileToolsError(f"Incomplete extraction: {raw_name}")
+                if target.exists():
+                    if not overwrite:
+                        raise FileExistsError(f"Destination already exists: {target}")
+                    backup = backups_root.joinpath(*parts)
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(target, backup)
+                    backups.append((target, backup))
+                os.replace(staged_file, target)
+                installed.append(target)
                 extracted.append(str(target))
 
-        return extracted
+            return extracted
+        except BaseException:
+            for target in reversed(installed):
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+            for target, backup in reversed(backups):
+                if backup.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(backup, target)
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            raise
+        finally:
+            shutil.rmtree(stage_root, ignore_errors=True)
 
     @staticmethod
     def tool_capability_catalog() -> list[dict[str, Any]]:
@@ -568,7 +867,7 @@ class FileTools:
         return "binary"
     # IMAGES
     def read_image_base64(self, name: str) -> dict[str, Any]:
-        path = self._path(name)
+        path = self._assert_readable(name)
         if not path.is_file():
             raise FileNotFoundError(str(path))
         raw = path.read_bytes()
@@ -668,7 +967,7 @@ class FileTools:
         return result
     # TEXTO
     def read_text_auto(self, name: str) -> str:
-        path = self._path(name)
+        path = self._assert_readable(name)
         if not path.is_file():
             raise FileNotFoundError(str(path))
         text = None
@@ -683,7 +982,7 @@ class FileTools:
         return self._truncate(text)
 
     def head_file(self, name: str, lines: int = 20) -> str:
-        path = self._path(name)
+        path = self._assert_readable(name)
         out: list[str] = []
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
@@ -693,13 +992,13 @@ class FileTools:
         return "".join(out)
 
     def tail_file(self, name: str, lines: int = 20) -> str:
-        path = self._path(name)
+        path = self._assert_readable(name)
         from collections import deque
         with path.open("r", encoding="utf-8", errors="replace") as f:
             return "".join(deque(f, maxlen=lines))
 
     def read_lines(self, name: str, start: int = 1, end: int | None = None) -> str:
-        path = self._path(name)
+        path = self._assert_readable(name)
         out: list[str] = []
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f, start=1):
@@ -745,7 +1044,7 @@ class FileTools:
             raise NotADirectoryError(str(root))
         ext_filter = {e.lower() for e in extensions} if extensions else None
         for file in root.rglob("*"):
-            if not file.is_file():
+            if file.is_symlink() or self._is_excluded_path(file.relative_to(self.workspace)) or not file.is_file():
                 continue
             if ext_filter and file.suffix.lower() not in ext_filter:
                 continue
@@ -767,7 +1066,7 @@ class FileTools:
     def read_pdf_text(self, name: str) -> str:
         if not _HAS_PYPDF:
             raise RuntimeError("pypdf is not installed.")
-        path = self._path(name)
+        path = self._assert_readable(name)
         if not path.is_file():
             raise FileNotFoundError(str(path))
         reader = PdfReader(str(path))
@@ -784,7 +1083,7 @@ class FileTools:
         return self._truncate("\n\n".join(parts))
     # GENERIC READING
     def read_any(self, name: str) -> dict[str, Any]:
-        path = self._path(name)
+        path = self._assert_readable(name)
         kind = self.detect_kind(name)
         if kind == "directory":
             return {
@@ -882,7 +1181,9 @@ class FileTools:
             if depth >= max_depth:
                 return node
             try:
-                for item in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+                for item in sorted(p.iterdir(), key=lambda x: x.name.casefold()):
+                    if item.is_symlink() or self._is_excluded_path(item.relative_to(self.workspace)):
+                        continue
                     if item.is_dir():
                         node["children"].append(walk(item, depth + 1))
                     else:
@@ -961,7 +1262,7 @@ class FileTools:
         return str(path)
 
     def read_csv(self, name: str, max_rows: int | None = None) -> list[dict[str, Any]]:
-        path = self._path(name)
+        path = self._assert_readable(name)
         rows: list[dict[str, Any]] = []
         with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.DictReader(f)
@@ -998,7 +1299,7 @@ class FileTools:
         root = self._path(directory)
         by_hash: dict[str, list[str]] = {}
         for file in root.rglob("*"):
-            if not file.is_file():
+            if file.is_symlink() or self._is_excluded_path(file.relative_to(self.workspace)) or not file.is_file():
                 continue
             try:
                 h = hashlib.sha256(file.read_bytes()).hexdigest()
